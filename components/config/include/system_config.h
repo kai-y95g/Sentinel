@@ -1,0 +1,10 @@
+#ifndef _SYSTEM_CONFIG_H_
+#define _SYSTEM_CONFIG_H_
+
+// DHT22 Configuration
+#define DHT22_PIN GPIO_NUM_4
+
+#define SENTINEL_TEMP_FIRE_THRESHOLD_C     45.0f
+#define SENTINEL_HUMIDITY_LOW_THRESHOLD_PCT 25.0f
+
+#endif
