@@ -6,36 +6,36 @@
 extern "C" {
 #endif
 
-#define FS          100.0f
-#define STA_SEC     0.5f
-#define LTA_SEC     10.0f
-#define GRAV_TAU    1.0f
-#define TRIG_ON     3.5f
-#define TRIG_OFF    1.2f
-#define MIN_EVENT_SAMPLES 30   // 300 ms at 100 Hz
+#define N       256
+#define STEP    128
+#define FS      100.0f
+#define F_LOW   1.0f
+#define F_HIGH  10.0f
 
+#define BIN_F1 ((int)(F_LOW  * N / FS))
+#define BIN_F2 ((int)(F_HIGH * N / FS))
 
-typedef struct {
-    float ax;
-    float ay;
-    float az;
-    float magnitude;
-} mpu6050_data_t;
+#define B0  0.056448462f
+#define B1  0.0f
+#define B2 -0.056448462f
+#define A1 -1.777737f
+#define A2  0.887103f
 
-typedef struct {
-    float b0,b1,b2,a1,a2;
-    float z1,z2;
-} biquad_t;
+typedef enum {
+    EQ_THREAT_NONE = 0,
+    EQ_THREAT_LOW,
+    EQ_THREAT_MEDIUM,
+    EQ_THREAT_HIGH,
+} eq_threat_level;
 
-typedef struct {
-    float gx, gy, gz;
-} gravity_t;
 
 void mpu6050_driver_init();
 
-esp_err_t mpu6050_driver_read_data(mpu6050_data_t *data);
+esp_err_t mpu6050_driver_read_data(float *ax, float *ay, float *az);
 
-void imu_task(void *arg);
+void mpu_dsp_task(void *arg);
+
+eq_threat_level evaluate_threat_eq(float E);
 
 #ifdef __cplusplus
 }

@@ -1,64 +1,148 @@
 #include <stdio.h>
 #include <math.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "esp_dsp.h"
+#include "i2cdev.h"
 #include "mpu6050.h"
 #include "mpu6050_driver.h"
-#include "i2cdev.h"
 #include "esp_log.h"
-#include "esp_dsp.h"
+#include "esp_err.h"
 #include "system_config.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define I2C_NUM I2C_NUM_0
 
 static const char *TAG = "MPU6050_driver";
 
-static gravity_t grav;
-static float grav_alpha;
-static float alpha_sta;
-static float alpha_lta;
-static float sta;
-static float lta;
-static bool triggered;
-static int event_count = 0;
-mpu6050_dev_t mpu = {0};
-mpu6050_acceleration_t accel;
+float ax[N], ay[N], az[N];   // ring buffers
+float mag[N];
+float filtered[N];
+float fft_buf[2*N];
+float hann[N];
 
-static biquad_t bp = {
-    .b0 =  0.067455,
-    .b1 =  0.000000,
-    .b2 = -0.067455,
-    .a1 = -1.14298,
-    .a2 =  0.86509,
-};
+int write_idx = 0;
+static float iir_x1 = 0, iir_x2 = 0, iir_y1 = 0, iir_y2 = 0;
 
+static mpu6050_dev_t mpu = {0};
+static mpu6050_acceleration_t accel;
 
-float biquad(biquad_t *f, float x)
+void unwrap(float *circ, float *lin)
 {
-    float y = f->b0*x + f->z1;
-    f->z1 = f->b1*x - f->a1*y + f->z2;
-    f->z2 = f->b2*x - f->a2*y;
-    return y;
+    int idx = write_idx;
+    for(int i=0;i<N;i++)
+        lin[i] = circ[(idx + i) % N];
 }
 
 
-void sta_lta_init(float fs)
+void compute_magnitude(float *x, float *y, float *z, float *m)
 {
-    grav_alpha = expf(-1.0f / (GRAV_TAU * fs));
-    alpha_sta  = expf(-1.0f / (STA_SEC * fs));
-    alpha_lta  = expf(-1.0f / (LTA_SEC * fs));
-
-    // reset all state
-    grav.gx = grav.gy = grav.gz = 0;
-    sta = 0;
-    lta = 1e-6;
-    bp.z1 = bp.z2 = 0;
-    triggered = false;
+    for(int i=0;i<N;i++)
+        m[i] = sqrtf(x[i]*x[i] + y[i]*y[i] + z[i]*z[i]);
 }
 
 
-void mpu6050_driver_init() 
+void remove_mean(float *x)
 {
+    float sum = 0;
+    for(int i=0;i<N;i++) sum += x[i];
+    float mean = sum / N;
+    for(int i=0;i<N;i++) x[i] -= mean;
+}
+
+
+void bandpass(float *x, float *y)
+{
+    for(int i=0;i<N;i++)
+    {
+        y[i] = B0*x[i] + B1*iir_x1 + B2*iir_x2 - A1*iir_y1 - A2*iir_y2;
+        iir_x2 = iir_x1; iir_x1 = x[i];
+        iir_y2 = iir_y1; iir_y1 = y[i];
+    }
+}
+
+
+
+void apply_hann(float *x)
+{
+    for(int i=0;i<N;i++)
+        x[i] *= hann[i];
+}
+
+void compute_fft(float *x)
+{
+    for(int i=0;i<N;i++){
+        fft_buf[2*i]   = x[i];
+        fft_buf[2*i+1] = 0;
+    }
+
+    dsps_fft2r_fc32(fft_buf, N);
+    dsps_bit_rev_fc32(fft_buf, N);
+    dsps_cplx2reC_fc32(fft_buf, N);
+}
+
+
+float compute_energy()
+{
+    float E = 0;
+
+    for(int k = BIN_F1; k <= BIN_F2; k++)
+    {
+        float re = fft_buf[2*k];
+        float im = fft_buf[2*k+1];
+        E += re*re + im*im;
+    }
+
+    return E / N;
+}
+
+
+void mpu_dsp_task(void *arg)
+{
+    TickType_t last = xTaskGetTickCount();
+    int hop = 0;
+
+    static float ax_lin[N], ay_lin[N], az_lin[N];
+
+    while (1)
+    {
+        /* ---- SAMPLE ---- */
+        float x,y,z;
+        mpu6050_driver_read_data(&x,&y,&z);
+
+        ax[write_idx] = x;
+        ay[write_idx] = y;
+        az[write_idx] = z;
+        write_idx = (write_idx + 1) % N;
+
+        /* ---- DSP every STEP samples ---- */
+        if (++hop >= STEP)
+        {
+            hop = 0;
+            iir_x1 = iir_x2 = iir_y1 = iir_y2 = 0;
+            unwrap(ax, ax_lin);
+            unwrap(ay, ay_lin);
+            unwrap(az, az_lin);
+
+            compute_magnitude(ax_lin, ay_lin, az_lin, mag);
+            remove_mean(mag);
+            bandpass(mag, filtered);
+            remove_mean(filtered);
+            apply_hann(filtered);
+
+            compute_fft(filtered);
+            float E = compute_energy();
+            eq_threat_level lvl = evaluate_threat_eq(E);
+
+//            printf("E=%.3f  LEVEL=%d\n", E, lvl);
+        }
+
+        /* ---- TIMING ---- */
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(1000/FS));
+    }
+}
+
+void mpu6050_driver_init() {
+
     ESP_ERROR_CHECK(i2cdev_init());
     ESP_ERROR_CHECK(
         mpu6050_init_desc(&mpu, MPU6050_ADDR, I2C_NUM, MPU6050_SDA_PIN, MPU6050_SCL_PIN)
@@ -66,87 +150,32 @@ void mpu6050_driver_init()
     ESP_ERROR_CHECK(mpu6050_init(&mpu));
 
     ESP_LOGI(TAG, "initialized device.");
-    mpu6050_set_full_scale_accel_range(&mpu, MPU6050_ACCEL_RANGE_2);
-    
-    sta_lta_init(FS);
+
+    dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    dsps_wind_hann_f32(hann, N);
 }
 
-
-void remove_gravity(mpu6050_acceleration_t *accel)
-{
-    grav.gx = grav_alpha * grav.gx + (1 - grav_alpha) * (accel->x);
-    grav.gy = grav_alpha * grav.gy + (1 - grav_alpha) * (accel->y);
-    grav.gz = grav_alpha * grav.gz + (1 - grav_alpha) * (accel->z);
-
-    accel->x -= grav.gx;
-    accel->y -= grav.gy;
-    accel->z -= grav.gz;
-}
-
-
-float update_sta_lta(float x)
-{
-    float e = x * x;   // energy
-    //printf("Eneregy :- %.2f\n",e);
-
-    sta = alpha_sta * sta + (1 - alpha_sta) * e;
-    lta = alpha_lta * lta + (1 - alpha_lta) * e;
-
-    //return sta / lta;
-    float res = sta/lta;
-    //printf("STA/LTA %.2f\n",res);
-    return res;
-}
-
-esp_err_t mpu6050_driver_read_data(mpu6050_data_t *data)
-{
+esp_err_t mpu6050_driver_read_data(float *ax, float *ay, float *az) {
     esp_err_t res = mpu6050_get_acceleration(&mpu, &accel);
     if (res != ESP_OK) return res;
-    remove_gravity(&accel);
-    data->ax = accel.x;
-    data->ay = accel.y;
-    data->az = accel.z;
-    data->magnitude = sqrtf(accel.x * accel.x + 
-                        accel.y * accel.y + 
-                        accel.z * accel.z);
+    *ax = accel.x;
+    *ay = accel.y;
+    *az = accel.z;
     return ESP_OK;
 }
 
-
-void imu_task(void *arg)
+eq_threat_level evaluate_threat_eq(float E)
 {
-    mpu6050_data_t data;
-    static int warmup = 0;
+    eq_threat_level level;
+    float db = 10*log10f(E+1e-9f);
+    static float y=0;
+    y = 0.9f*y + 0.1f*db;
 
-    while (1) {
-        mpu6050_driver_read_data(&data);
+    if (y > 5)       level = EQ_THREAT_HIGH;
+    else if (y > 2)  level = EQ_THREAT_MEDIUM;
+    else if (y > -5) level = EQ_THREAT_LOW;
+    else             level = EQ_THREAT_NONE;
 
-        if (warmup < FS) {
-            warmup++;
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        float y = biquad(&bp, data.magnitude);
-        float r = update_sta_lta(y);
-        if (r > TRIG_ON) {
-            event_count++;
-            printf("STA/LTA %.2f\n",r);
-            if (!triggered && event_count > MIN_EVENT_SAMPLES) {
-                triggered = true;
-                printf("EVENT ON\n");
-            }
-        } else {
-            event_count = 0;
-        }
-
-        if (triggered && (r < TRIG_OFF)) {
-            printf("Reached here 2\n");
-            printf("STA/LTA %.2f\n",r);
-            triggered = false;
-            printf("EVENT OFF\n");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+//    printf("E=%.3f  db=%.2f  LEVEL=%d\n", E, y, level);
+    return level;
 }
