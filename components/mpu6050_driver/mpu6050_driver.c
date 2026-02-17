@@ -298,7 +298,24 @@ eq_threat_level evaluate_threat_eq(float E)
     eq_threat_level level;
     float db = 10 * log10f(E + 1e-9f);
     static float y = 0;
-    y = 0.9f * y + 0.1f * db;
+    
+    y = 0.75f * y + 0.25f * db;
+    /* ----------------------------------------------------------------------
+    * Exponential Moving Average (EMA) smoothing of P-wave energy in dB
+    *
+    * y = 0.75*y + 0.25*db
+    *
+    * - Purpose: Smooths out short-term fluctuations in P-wave energy readings
+    *   from the MPU6050 to prevent false alarm triggering.
+    * - α = 0.25 (new sample weight): Provides a balance between responsiveness
+    *   and noise suppression.
+    * - Previous value weight = 0.75: Retains historical trend to detect
+    *   sustained energy increases.
+    *
+    * Note: Adjust α to tune sensitivity:
+    *   Higher α (e.g., 0.3–0.5) → more responsive but more noise-prone
+    *   Lower α (e.g., 0.1–0.2) → smoother but slower to react
+    * ------------------------------------------------------------------- */
 
     if (y > 5)
         level = EQ_THREAT_HIGH;
@@ -310,7 +327,7 @@ eq_threat_level evaluate_threat_eq(float E)
         level = EQ_THREAT_NONE;
 
     // Optional debug print
-    printf("E=%.3f  db=%.2f  LEVEL=%d\n", E, y, level);
+    // printf("E=%.3f  db=%.2f  LEVEL=%d\n", E, y, level);
 
     return level;
 }
